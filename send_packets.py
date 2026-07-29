@@ -37,6 +37,19 @@ CAPTURED_PAYLOAD = bytes.fromhex("""
 302020202032302020201c391e423036331c47393146413443344203
 """)
 
+# Timeout reversal template: the original purchase with message subtype T.
+CAPTURED_PAYLOAD_REVERSAL = bytes.fromhex("""
+0131392e333630303030303030332020202020202020202020202020323630373037313432303034
+465430303135303030301c42303030311c44301c55301c6530301c68303031303835303035301c71
+3b343033333035303037323633333537393d33303033323031313030303032323631303030303f1c
+361e453037311e493937381e4f303138303030383236303730373636453545373541373930324139
+46343030303030313634363141313636394430303030303030303030303039373830303030303030
+303530303030363032313230334130303030301e50303130313232303230303030303039364130
+3030303030303033313031301e71303139463645303432303730303030301e583030303030301e30
+302020202032302020201c391e423036331c47393146413443344203
+""")
+
+
 def parse_spdh(payload: bytes) -> dict[str, str]:
     if len(payload) >= 2 and int.from_bytes(payload[:2], "big") == len(payload) - 2:
         body = payload[2:]
@@ -72,6 +85,7 @@ def parse_spdh(payload: bytes) -> dict[str, str]:
         "response_code": header[45:48],
         "sequence": fields.get("h", ""),
         "amount": fields.get("B", ""),
+        "approval_code": fields.get("F", "").strip(),
         "message_text": fields.get("g", ""),
         "batch_debit_count": batch_debit_count,
         "batch_debit_amount": batch_debit_amount,
@@ -89,6 +103,7 @@ def print_spdh_summary(label: str, payload: bytes) -> None:
     print(
         f"{label}: transmission={parsed['transmission']} "
         f"TID={parsed['tid']} seq={parsed['sequence'] or '-'} "
+        f"transaction_code={parsed['transaction_code']} "
         f"amount={parsed['amount'] or '-'} RC={rc} ({rc_text})"
     )
     if parsed["message_text"]:
@@ -197,6 +212,7 @@ def _reserve_message_numbers(
     initial_transmission_number: str,
     *,
     record: bool = True,
+    increment_sequence: bool = True,
     increment_batch: bool = False,
     tid=None,
 ) -> tuple[str, str]:
@@ -210,9 +226,13 @@ def _reserve_message_numbers(
     tid_state = RUNTIME_TID_STATES.get(state_key)
     if tid_state is not None:
         previous_sequence = tid_state["sequence_number"]
-        sequence_number = (
-            f"{previous_sequence[:6]}{(int(previous_sequence[6:]) + 10) % 10000:04d}"
-        )
+        if increment_sequence:
+            sequence_number = (
+                f"{previous_sequence[:6]}"
+                f"{(int(previous_sequence[6:]) + 10) % 10000:04d}"
+            )
+        else:
+            sequence_number = previous_sequence
         previous_transmission = tid_state["transmission_number"]
         transmission_number = f"{(int(previous_transmission) + 1) % 100:02d}"
         if increment_batch:
@@ -256,8 +276,6 @@ def _reserve_message_numbers(
                 sequence_number = initial_sequence_number
                 transmission_number = initial_transmission_number
 
-    # SPDH transmission number is fixed to 00 for every SALE/CLOSE request.
-    transmission_number = "00"
     next_sequence_suffix = int(sequence_number[6:]) + 10
     sequence_width = len(sequence_number) - 6
     # Adding 10 advances the three-digit rcncltPrdId at positions 6..8,
@@ -297,6 +315,7 @@ def reserve_message_numbers(
     initial_transmission_number: str,
     *,
     record: bool = True,
+    increment_sequence: bool = True,
     increment_batch: bool = False,
     tid=None,
 ) -> tuple[str, str]:
@@ -307,6 +326,7 @@ def reserve_message_numbers(
             initial_sequence_number,
             initial_transmission_number,
             record=record,
+            increment_sequence=increment_sequence,
             increment_batch=increment_batch,
             tid=tid,
         )
@@ -315,13 +335,19 @@ def reserve_message_numbers(
 def save_next_sale_numbers(
     tid: str,
     sent_sequence_number: str,
+    sent_transmission_number: str,
     *,
+    increment_sequence: bool = True,
     increment_batch: bool,
+    reset_transmission: bool = False,
 ) -> None:
     """Persist the next SALE values after the current SALE has been executed."""
     with STATE_LOCK:
-        next_suffix = (int(sent_sequence_number[6:]) + 10) % 10000
-        next_sequence = f"{sent_sequence_number[:6]}{next_suffix:04d}"
+        if increment_sequence:
+            next_suffix = (int(sent_sequence_number[6:]) + 10) % 10000
+            next_sequence = f"{sent_sequence_number[:6]}{next_suffix:04d}"
+        else:
+            next_sequence = sent_sequence_number
         if increment_batch:
             next_batch = int(next_sequence[3:6]) % 999 + 1
             next_sequence = (
@@ -330,8 +356,15 @@ def save_next_sale_numbers(
 
         next_state = {
             "sequence_number": next_sequence,
-            "transmission_number": "00",
+            "transmission_number": (
+                "00"
+                if reset_transmission
+                else f"{(int(sent_transmission_number) + 1) % 100:02d}"
+            ),
         }
+        if reset_transmission and tid in RUNTIME_TID_STATES:
+            # The next in-process reservation increments 99 to 00.
+            RUNTIME_TID_STATES[tid]["transmission_number"] = "99"
         temporary_file = NEXT_PACKET_FILE.with_suffix(
             NEXT_PACKET_FILE.suffix + ".tmp"
         )
@@ -409,6 +442,10 @@ def build_payload(
     # TID occupies bytes 6..13 in this SPDH message.
     payload[6:14] = tid.encode("ascii")
 
+    now = datetime.now()
+    payload[28:34] = now.strftime("%y%m%d").encode("ascii")
+    payload[34:40] = now.strftime("%H%M%S").encode("ascii")
+
     # Field h contains the sequence number.
     sequence_start = payload.index(b"\x1ch") + 2
     payload[sequence_start:sequence_start + 10] = sequence_number.encode("ascii")
@@ -423,6 +460,49 @@ def build_payload(
 
     if int.from_bytes(payload[:2], "big") != len(payload) - 2:
         raise RuntimeError(f"Unexpected SALE payload length: {len(payload)}")
+    return bytes(payload)
+
+
+def build_reversal_payload(
+    sale_payload: bytes,
+    reversal_sequence_number: str,
+    reversal_amount: str,
+    approval_code: str,
+) -> bytes:
+    """Fill an online timeout reversal (subtype T) from its SALE."""
+    if len(reversal_sequence_number) != 10 or not reversal_sequence_number.isdigit():
+        raise ValueError("reversal_sequence_number must contain exactly 10 digits")
+    if not reversal_amount or not reversal_amount.isdigit():
+        raise ValueError("reversal_amount must contain only digits")
+
+    sale_body = sale_payload[2:]
+    sale_header = sale_body[:48]
+    sale_fields = {}
+    for part in sale_body[48:].rstrip(b"\x03").split(b"\x1c"):
+        if part:
+            sale_fields[chr(part[0])] = part[1:]
+
+    payload = bytearray(CAPTURED_PAYLOAD_REVERSAL)
+    payload[4:6] = sale_header[2:4]
+    payload[6:14] = sale_header[4:12]
+    now = datetime.now()
+    payload[28:34] = now.strftime("%y%m%d").encode("ascii")
+    payload[34:40] = now.strftime("%H%M%S").encode("ascii")
+
+    def replace_field(field: bytes, value: bytes) -> None:
+        start = payload.index(b"\x1c" + field) + 2
+        end = payload.find(b"\x1c", start)
+        if end == -1:
+            end = len(payload) - 1
+        payload[start:end] = value
+
+    replace_field(b"B", reversal_amount.encode("ascii"))
+    replace_field(b"h", reversal_sequence_number.encode("ascii"))
+    replace_field(b"q", sale_fields["q"])
+
+    # The captured MAC is invalid once dynamic fields have changed.
+    remove_captured_mac(payload)
+    payload[:2] = (len(payload) - 2).to_bytes(2, "big")
     return bytes(payload)
 
 
@@ -447,7 +527,7 @@ def response_summary(payload: bytes) -> str:
     )
 
 
-def send_one_packet(
+def send_sale(
     host: str,
     port: int,
     timeout: float,
@@ -475,6 +555,54 @@ def send_one_packet(
     return parse_spdh(response)
 
 
+def send_reversal(
+    host: str,
+    port: int,
+    timeout: float,
+    sale_sequence_number: str,
+    reversal_sequence_number: str,
+    transmission_number: str,
+    tid: str,
+    amount: str,
+    approval_code: str,
+) -> dict[str, str]:
+    sale_payload = build_payload(
+        sale_sequence_number,
+        transmission_number,
+        tid,
+        amount.zfill(4),
+    )
+    payload = build_reversal_payload(
+        sale_payload,
+        reversal_sequence_number,
+        amount,
+        approval_code,
+    )
+    parsed_request = parse_spdh(payload)
+    if (
+        parsed_request.get("message") != "FT"
+        or parsed_request.get("transaction_code") != "00"
+    ):
+        raise RuntimeError(
+            "REVERSAL blocked: generated payload is not an FT00 reversal"
+        )
+    print_spdh_summary("REVERSAL request", payload)
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        source_ip, source_port = sock.getsockname()[:2]
+        print(
+            f"REVERSAL TID={tid} source={source_ip}:{source_port} "
+            f"sale_sequence={sale_sequence_number} "
+            f"sequence={reversal_sequence_number}",
+            flush=True,
+        )
+        sock.sendall(payload)
+        sock.settimeout(timeout)
+        response = sock.recv(4096)
+
+    print(f"REVERSAL response: {response_summary(response)}", flush=True)
+    return parse_spdh(response)
+
+
 def send_close_batch(
     host: str,
     port: int,
@@ -494,6 +622,7 @@ def send_close_batch(
 
 def send_packets(host: str, port: int, timeout: float, *, state_file=STATE_FILE,
                  nof_trx, tid, amount, delay_seconds=0.0,
+                 reversal_delay=1.0,
                  close_batch_delay_seconds=0.0, send_close_batches=False,
                  parallel_close_batches=True,
                  increment_batch_per_sale=False, initial_sequence_number,
@@ -531,8 +660,11 @@ def send_packets(host: str, port: int, timeout: float, *, state_file=STATE_FILE,
         )
         sale_approved = False
         sequence_rejected = False
+        reversal_sequence_number = None
+        reversal_transmission_number = None
+        persisted_sequence_number = None
         try:
-            response = send_one_packet(
+            response = send_sale(
                 host,
                 port,
                 timeout,
@@ -553,6 +685,73 @@ def send_packets(host: str, port: int, timeout: float, *, state_file=STATE_FILE,
                 )
             sale_approved = response.get("response_code") in {"000", "001"}
             print(f"SALE sequence={sequence_number} approved={sale_approved}", flush=True)
+            approval_code = response.get("approval_code", "")
+            if not sequence_rejected:
+                # Persist the next TRX immediately after the SALE.
+                save_next_sale_numbers(
+                    tid,
+                    sequence_number,
+                    transmission_number,
+                    increment_sequence=not (sale_approved and approval_code),
+                    increment_batch=(
+                        False
+                        if sale_approved and approval_code
+                        else increment_batch_per_sale
+                    ),
+                )
+                persisted_sequence_number = sequence_number
+            if sale_approved and approval_code:
+                print(
+                    f"Waiting {reversal_delay}s before REVERSAL "
+                    f"for SALE sequence={sequence_number}",
+                    flush=True,
+                )
+                time.sleep(reversal_delay)
+                reversal_sequence_number, reversal_transmission_number = (
+                    reserve_message_numbers(
+                        state_file,
+                        initial_sequence_number,
+                        initial_transmission_number,
+                        record=False,
+                        increment_sequence=False,
+                        increment_batch=False,
+                        tid=tid,
+                    )
+                )
+                reversal_response = send_reversal(
+                    host,
+                    port,
+                    timeout,
+                    sequence_number,
+                    reversal_sequence_number,
+                    reversal_transmission_number,
+                    tid,
+                    amount,
+                    approval_code,
+                )
+                # Persist the next SALE immediately after the REVERSAL.
+                save_next_sale_numbers(
+                    tid,
+                    reversal_sequence_number,
+                    reversal_transmission_number,
+                    increment_batch=increment_batch_per_sale,
+                    reset_transmission=True,
+                )
+                persisted_sequence_number = reversal_sequence_number
+                reversal_approved = (
+                    reversal_response.get("response_code") in {"000", "001"}
+                )
+                print(
+                    f"REVERSAL sequence={reversal_sequence_number} "
+                    f"approved={reversal_approved}",
+                    flush=True,
+                )
+            elif sale_approved:
+                print(
+                    f"REVERSAL skipped for SALE sequence={sequence_number}: "
+                    "approval code missing from SALE response",
+                    flush=True,
+                )
             if not sequence_rejected:
                 with STATE_LOCK:
                     try:
@@ -574,17 +773,24 @@ def send_packets(host: str, port: int, timeout: float, *, state_file=STATE_FILE,
             )
         if not sequence_rejected:
             sale_results.append((sequence_number, sale_approved))
-            save_next_sale_numbers(
-                tid,
-                sequence_number,
-                increment_batch=increment_batch_per_sale,
-            )
+            last_sent_sequence = reversal_sequence_number or sequence_number
+            if persisted_sequence_number != last_sent_sequence:
+                save_next_sale_numbers(
+                    tid,
+                    last_sent_sequence,
+                    reversal_transmission_number or transmission_number,
+                    increment_batch=(
+                        increment_batch_per_sale
+                        if reversal_sequence_number
+                        else False
+                    ),
+                    reset_transmission=reversal_sequence_number is not None,
+                )
 
         if attempt != nof_trx - 1:
             time.sleep(delay_seconds)
 
     if not send_close_batches:
-        print("SEND_CLOSE_BATCHES=False: skipping all CLOSE BATCH requests", flush=True)
         return sale_results
 
     print(

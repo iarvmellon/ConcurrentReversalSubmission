@@ -1,9 +1,13 @@
 """Configurable sales runner."""
 from pathlib import Path
+import time
 
 from send_packets import (
     STATE_FILE,
-    send_packets,
+    reserve_message_numbers,
+    save_next_sale_numbers,
+    send_reversal,
+    send_sale,
 )
 INITIAL_SEQUENCE_NUMBER = "0015304720"
 INITIAL_TRANSMISSION_NUMBER = "70"
@@ -13,39 +17,76 @@ PORT = 28420
 TIMEOUT = 5.0
 TIDS = ["00003971"]
 AMOUNT = "0001"
-TRANSACTION_COUNT = 30
+REVERSAL_AMOUNT = "1"
 INCREMENT_BATCH_PER_SALE = True
+reversal_delay = 0
 STATE = Path(STATE_FILE)
 
 
-def send_sales(host, port, timeout, count, tid, amount, delay=0.0,
-               increment_batch_per_sale=False):
-    """Send sales serially, waiting *delay* seconds between requests."""
-    return send_packets(host, port, timeout, state_file=STATE, nof_trx=count,
-                        tid=tid, amount=amount, delay_seconds=delay,
-                        send_close_batches=False,
-                        increment_batch_per_sale=increment_batch_per_sale,
-                        initial_sequence_number=INITIAL_SEQUENCE_NUMBER,
-                        initial_transmission_number=INITIAL_TRANSMISSION_NUMBER)
-
-
 def main():
-    print(
-        f"Sending {TRANSACTION_COUNT} sales sequentially for each of "
-        f"{len(TIDS)} TIDs ({len(TIDS) * TRANSACTION_COUNT} total)",
-        flush=True,
+    tid = TIDS[0]
+    sale_sequence, sale_transmission = reserve_message_numbers(
+        STATE,
+        INITIAL_SEQUENCE_NUMBER,
+        INITIAL_TRANSMISSION_NUMBER,
+        increment_batch=INCREMENT_BATCH_PER_SALE,
+        tid=tid,
     )
-    for tid in TIDS:
-        send_sales(
-            HOST,
-            PORT,
-            TIMEOUT,
-            TRANSACTION_COUNT,
-            tid,
-            AMOUNT,
-            delay=0.1,
-            increment_batch_per_sale=INCREMENT_BATCH_PER_SALE,
-        )
+    sale_response = send_sale(
+        HOST,
+        PORT,
+        TIMEOUT,
+        sale_sequence,
+        sale_transmission,
+        tid,
+        AMOUNT,
+    )
+    approval_code = sale_response.get("approval_code", "")
+    sale_approved = sale_response.get("response_code") in {"000", "001"}
+
+    # The next TRX is the reversal: same batch, next sequence component and TRN.
+    save_next_sale_numbers(
+        tid,
+        sale_sequence,
+        sale_transmission,
+        increment_sequence=False,
+        increment_batch=False,
+    )
+
+    # if not sale_approved or not approval_code:
+    #     print("REVERSAL not sent: SALE was not approved or has no approval code")
+    #     return
+
+    time.sleep(reversal_delay)
+    reversal_sequence, reversal_transmission = reserve_message_numbers(
+        STATE,
+        INITIAL_SEQUENCE_NUMBER,
+        INITIAL_TRANSMISSION_NUMBER,
+        record=False,
+        increment_sequence=False,
+        increment_batch=False,
+        tid=tid,
+    )
+    send_reversal(
+        HOST,
+        PORT,
+        TIMEOUT,
+        sale_sequence,
+        reversal_sequence,
+        reversal_transmission,
+        tid,
+        REVERSAL_AMOUNT,
+        approval_code,
+    )
+
+    # After the reversal, persist the counters for the next SALE.
+    save_next_sale_numbers(
+        tid,
+        reversal_sequence,
+        reversal_transmission,
+        increment_batch=INCREMENT_BATCH_PER_SALE,
+        reset_transmission=True,
+    )
 
 
 if __name__ == "__main__":

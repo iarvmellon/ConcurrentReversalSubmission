@@ -1,4 +1,16 @@
 {
-  "sequence_number": "0016150800",
-  "transmission_number": "00"
+  "sales": [
+    {
+      "sequence_number": "0016511550",
+      "transmission_number": "00"
+    },
+    {
+      "sequence_number": "0016511560",
+      "transmission_number": "00"
+    },
+    {
+      "sequence_number": "0016511570",
+      "transmission_number": "00"
+    }
+  ]
 }

@@ -13,6 +13,7 @@ NEXT_PACKET_FILE = Path(__file__).with_name("next_TRX_per_TID.json")
 STATE_LOCK = threading.RLock()
 RUNTIME_TID_STATES = {}
 ALLOWED_SALE_TID = "00003971"
+REVERSALS_ENABLED = False
 
 RESPONSE_CODES = {
     "000": "Approved",
@@ -37,7 +38,7 @@ CAPTURED_PAYLOAD = bytes.fromhex("""
 302020202032302020201c391e423036331c47393146413443344203
 """)
 
-# Timeout reversal template: the original purchase with message subtype T.
+# Timeout reversal template with message subtype T.
 CAPTURED_PAYLOAD_REVERSAL = bytes.fromhex("""
 0131392e333630303030303030332020202020202020202020202020323630373037313432303034
 465430303135303030301c42303030311c44301c55301c6530301c68303031303835303035301c71
@@ -86,6 +87,7 @@ def parse_spdh(payload: bytes) -> dict[str, str]:
         "sequence": fields.get("h", ""),
         "amount": fields.get("B", ""),
         "approval_code": fields.get("F", "").strip(),
+        "rrn": fields.get("i", "").strip(),
         "message_text": fields.get("g", ""),
         "batch_debit_count": batch_debit_count,
         "batch_debit_amount": batch_debit_amount,
@@ -108,6 +110,8 @@ def print_spdh_summary(label: str, payload: bytes) -> None:
     )
     if parsed["message_text"]:
         print(f"{label}: text={parsed['message_text']}")
+    if parsed["rrn"]:
+        print(f"{label}: RRN={parsed['rrn']}")
 
 
 def remove_captured_mac(payload: bytearray) -> None:
@@ -469,7 +473,7 @@ def build_reversal_payload(
     reversal_amount: str,
     approval_code: str,
 ) -> bytes:
-    """Fill an online timeout reversal (subtype T) from its SALE."""
+    """Fill a timeout reversal (subtype T) from its SALE."""
     if len(reversal_sequence_number) != 10 or not reversal_sequence_number.isdigit():
         raise ValueError("reversal_sequence_number must contain exactly 10 digits")
     if not reversal_amount or not reversal_amount.isdigit():
@@ -506,6 +510,78 @@ def build_reversal_payload(
     return bytes(payload)
 
 
+def increment_sequence_third_component(sequence_number: str) -> str:
+    """Increment the third 3-digit component while preserving the final flag."""
+    if len(sequence_number) != 10 or not sequence_number.isdigit():
+        raise ValueError("sequence_number must contain exactly 10 digits")
+    next_component = (int(sequence_number[6:9]) + 1) % 1000
+    return f"{sequence_number[:6]}{next_component:03d}{sequence_number[9]}"
+
+
+def reserve_sale_run(
+    state_file: Path,
+    initial_sequence_number: str,
+    tid: str,
+    sale_count: int = 3,
+) -> list[tuple[str, str]]:
+    """Reserve one batch of SALE counters for a single program run."""
+    if sale_count < 1 or sale_count > 100:
+        raise ValueError("sale_count must be between 1 and 100")
+
+    with STATE_LOCK:
+        try:
+            next_packet = json.loads(NEXT_PACKET_FILE.read_text(encoding="utf-8"))
+            configured_sales = next_packet.get("sales")
+            if isinstance(configured_sales, list) and configured_sales:
+                first_sequence = configured_sales[0]["sequence_number"]
+                first_transmission = configured_sales[0]["transmission_number"]
+            else:
+                # Backwards compatibility with the previous state-file format.
+                first_sequence = next_packet["sequence_number"]
+                first_transmission = next_packet["transmission_number"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            first_sequence = initial_sequence_number
+            first_transmission = "00"
+            configured_sales = None
+
+        if len(first_sequence) != 10 or not first_sequence.isdigit():
+            raise ValueError("sequence_number must contain exactly 10 digits")
+        if len(first_transmission) != 2 or not first_transmission.isdigit():
+            raise ValueError("transmission_number must contain exactly 2 digits")
+
+        try:
+            recorded = json.loads(state_file.read_text(encoding="utf-8"))
+            history = recorded if isinstance(recorded, list) else recorded.get("history", [])
+        except (OSError, json.JSONDecodeError):
+            history = []
+
+        reservations = []
+        sequence = first_sequence
+        transmission = int(first_transmission)
+        if isinstance(configured_sales, list) and len(configured_sales) == sale_count:
+            reservations = [
+                (sale["sequence_number"], "00")
+                for sale in configured_sales
+            ]
+            sequence = increment_sequence_third_component(reservations[-1][0])
+
+        for _ in range(sale_count - len(reservations)):
+            transmission_number = "00"
+            reservations.append((sequence, transmission_number))
+            history.append(
+                {
+                    "sequence_number": sequence,
+                    "transmission_number": transmission_number,
+                    "saved_at": datetime.now().isoformat(timespec="seconds"),
+                    "tid": tid,
+                }
+            )
+            sequence = increment_sequence_third_component(sequence)
+
+        save_state({"history": history}, state_file)
+        return reservations
+
+
 def response_summary(payload: bytes) -> str:
     parsed = parse_spdh(payload)
     if "error" in parsed:
@@ -515,6 +591,8 @@ def response_summary(payload: bytes) -> str:
     rc_text = RESPONSE_CODES.get(rc, "Unknown response code")
     text = parsed["message_text"]
     extra = f", text={text}" if text else ""
+    if parsed["rrn"]:
+        extra += f", RRN={parsed['rrn']}"
     if parsed["batch_debit_amount"]:
         extra += (
             f", batch_debit_count={parsed['batch_debit_count']}"
@@ -555,6 +633,60 @@ def send_sale(
     return parse_spdh(response)
 
 
+def send_sales_in_order(
+    host: str,
+    port: int,
+    timeout: float,
+    sales: list[tuple[str, str]],
+    tid: str,
+    amount: str,
+) -> list[dict[str, str]]:
+    """Send SALE messages sequentially through one TCP connection."""
+    if tid != ALLOWED_SALE_TID:
+        raise ValueError(
+            f"SALE blocked for TID={tid}; only TID={ALLOWED_SALE_TID} is allowed"
+        )
+
+    ordered_sales = sorted(sales, key=lambda sale: int(sale[0][6:9]))
+    components = [int(sequence[6:9]) for sequence, _ in ordered_sales]
+    expected_components = list(
+        range(components[0], components[0] + len(components))
+    )
+    if components != expected_components:
+        raise ValueError(
+            "SALE sequence third components must be consecutive and ordered: "
+            f"received={components}, expected={expected_components}"
+        )
+
+    responses = []
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        source_ip, source_port = sock.getsockname()[:2]
+        for sale_number, (sequence_number, transmission_number) in enumerate(
+            ordered_sales, 1
+        ):
+            transmission_number = "00"
+            payload = build_payload(
+                sequence_number,
+                transmission_number,
+                tid,
+                amount,
+            )
+            print(
+                f"SALE {sale_number}/{len(ordered_sales)} TID={tid} "
+                f"source={source_ip}:{source_port} "
+                f"transmission={transmission_number} "
+                f"sequence={sequence_number}",
+                flush=True,
+            )
+            sock.sendall(payload)
+            sock.settimeout(timeout)
+            response = sock.recv(4096)
+            print(f"Response: {response_summary(response)}", flush=True)
+            responses.append(parse_spdh(response))
+
+    return responses
+
+
 def send_reversal(
     host: str,
     port: int,
@@ -566,6 +698,8 @@ def send_reversal(
     amount: str,
     approval_code: str,
 ) -> dict[str, str]:
+    if not REVERSALS_ENABLED:
+        raise RuntimeError("REVERSAL sending is disabled")
     sale_payload = build_payload(
         sale_sequence_number,
         transmission_number,
@@ -601,6 +735,114 @@ def send_reversal(
 
     print(f"REVERSAL response: {response_summary(response)}", flush=True)
     return parse_spdh(response)
+
+
+def send_sale_and_reversal_before_responses(
+    host: str,
+    port: int,
+    timeout: float,
+    sale_sequence_number: str,
+    reversal_sequence_number: str,
+    transmission_number: str,
+    tid: str,
+    sale_amount: str,
+    reversal_amount: str,
+    reversal_delay: float = 0.0,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Send SALE and its timeout REVERSAL before receiving either response."""
+    if not REVERSALS_ENABLED:
+        raise RuntimeError("REVERSAL sending is disabled")
+    if tid != ALLOWED_SALE_TID:
+        raise ValueError(
+            f"SALE blocked for TID={tid}; only TID={ALLOWED_SALE_TID} is allowed"
+        )
+    expected_reversal_sequence = increment_sequence_third_component(
+        sale_sequence_number
+    )
+    if reversal_sequence_number != expected_reversal_sequence:
+        raise ValueError(
+            "Timeout REVERSAL must increment the SALE sequence third component "
+            f"by one: sale={sale_sequence_number}, "
+            f"expected={expected_reversal_sequence}, "
+            f"reversal={reversal_sequence_number}"
+        )
+
+    sale_payload = build_payload(
+        sale_sequence_number,
+        transmission_number,
+        tid,
+        sale_amount,
+    )
+    reversal_payload = build_reversal_payload(
+        sale_payload,
+        reversal_sequence_number,
+        reversal_amount,
+        approval_code="",
+    )
+    parsed_reversal = parse_spdh(reversal_payload)
+    if (
+        parsed_reversal.get("message") != "FT"
+        or parsed_reversal.get("transaction_code") != "00"
+        or parsed_reversal.get("transmission") != transmission_number
+    ):
+        raise RuntimeError(
+            "REVERSAL blocked: generated payload is not a matching FT00 reversal"
+        )
+
+    sale_socket = socket.create_connection((host, port), timeout=timeout)
+    reversal_socket = None
+    try:
+        sale_source_ip, sale_source_port = sale_socket.getsockname()[:2]
+        print(
+            f"SALE TID={tid} source={sale_source_ip}:{sale_source_port} "
+            f"transmission={transmission_number} "
+            f"sequence={sale_sequence_number}",
+            flush=True,
+        )
+        sale_socket.sendall(sale_payload)
+
+        if reversal_delay > 0:
+            print(
+                f"Waiting {reversal_delay}s before REVERSAL without reading "
+                "the SALE response",
+                flush=True,
+            )
+            time.sleep(reversal_delay)
+
+        reversal_socket = socket.create_connection((host, port), timeout=timeout)
+        reversal_source_ip, reversal_source_port = reversal_socket.getsockname()[:2]
+        print_spdh_summary("REVERSAL request", reversal_payload)
+        print(
+            f"REVERSAL TID={tid} "
+            f"source={reversal_source_ip}:{reversal_source_port} "
+            f"sale_sequence={sale_sequence_number} "
+            f"sequence={reversal_sequence_number}",
+            flush=True,
+        )
+        reversal_socket.sendall(reversal_payload)
+        print(
+            "SALE and REVERSAL transmitted; now receiving responses",
+            flush=True,
+        )
+
+        sale_socket.settimeout(timeout)
+        sale_response_payload = sale_socket.recv(4096)
+        print(f"SALE response: {response_summary(sale_response_payload)}", flush=True)
+
+        reversal_socket.settimeout(timeout)
+        reversal_response_payload = reversal_socket.recv(4096)
+        print(
+            f"REVERSAL response: {response_summary(reversal_response_payload)}",
+            flush=True,
+        )
+        return (
+            parse_spdh(sale_response_payload),
+            parse_spdh(reversal_response_payload),
+        )
+    finally:
+        sale_socket.close()
+        if reversal_socket is not None:
+            reversal_socket.close()
 
 
 def send_close_batch(
@@ -700,7 +942,7 @@ def send_packets(host: str, port: int, timeout: float, *, state_file=STATE_FILE,
                     ),
                 )
                 persisted_sequence_number = sequence_number
-            if sale_approved and approval_code:
+            if sale_approved and approval_code and REVERSALS_ENABLED:
                 print(
                     f"Waiting {reversal_delay}s before REVERSAL "
                     f"for SALE sequence={sequence_number}",
@@ -744,6 +986,11 @@ def send_packets(host: str, port: int, timeout: float, *, state_file=STATE_FILE,
                 print(
                     f"REVERSAL sequence={reversal_sequence_number} "
                     f"approved={reversal_approved}",
+                    flush=True,
+                )
+            elif sale_approved and not REVERSALS_ENABLED:
+                print(
+                    f"REVERSAL disabled for SALE sequence={sequence_number}",
                     flush=True,
                 )
             elif sale_approved:
@@ -923,9 +1170,35 @@ def send_packets(host: str, port: int, timeout: float, *, state_file=STATE_FILE,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Send the captured SPDH packet over TCP")
-    parser.add_argument("--host", default=HOST)
-    parser.add_argument("--port", type=int, default=PORT)
+    parser = argparse.ArgumentParser(description="Send one SPDH SALE over TCP")
+    parser.add_argument("--host", default="10.1.110.84")
+    parser.add_argument("--port", type=int, default=28420)
     parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument("--tid", default=ALLOWED_SALE_TID)
+    parser.add_argument("--amount", default="0001")
     args = parser.parse_args()
-    send_packets(args.host, args.port, args.timeout)
+
+    sequence, transmission = reserve_message_numbers(
+        STATE_FILE,
+        "0015304720",
+        "70",
+        increment_batch=True,
+        tid=args.tid,
+    )
+    response = send_sale(
+        args.host,
+        args.port,
+        args.timeout,
+        sequence,
+        transmission,
+        args.tid,
+        args.amount,
+    )
+    approved = response.get("response_code") in {"000", "001"}
+    print(f"SALE approved={approved}", flush=True)
+    save_next_sale_numbers(
+        args.tid,
+        sequence,
+        transmission,
+        increment_batch=True,
+    )

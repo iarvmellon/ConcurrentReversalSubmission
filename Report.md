@@ -1,49 +1,44 @@
-# Batch Closing Stress Test Report
+# Concurrent Reversal and Batch Closing Report
 
-## Test objective
+## Objective
 
-The test evaluated the behavior of the payment terminal when a large number
-of SALE and CLOSE BATCH requests are processed.
+Resolve the unbalanced-batch condition produced when the connection closes
+before the response to the final SALE is received.
 
-## Sales phase
+## Implemented flow
 
-- **Total TIDs:** 30
-- **SALE requests per TID:** 30
-- **Total SALE requests:** 900
-- **Batch assignment:** one different batch number per SALE
-- **Expected result:** 900 distinct batches were created and were ready to be
-  closed independently.
+- **TID:** `00003971`
+- **SALE requests:** 4
+- **SALE amount:** `0001` per request
+- The four SALE requests are transmitted over the same TCP connection.
+- The application reads the responses to SALE 1–3.
+- After SALE 4 is transmitted, the application closes the original connection
+  without reading its response.
+- After three seconds, it sends a timeout REVERSAL over a new connection. The
+  REVERSAL uses the same sequence number as SALE 4.
+- After receiving the REVERSAL response, it waits one second and sends one
+  CLOSE BATCH over a third connection.
 
-## Batch-closing phase
+## CLOSE BATCH totals
 
-After the SALE requests completed, the application sent the corresponding
-CLOSE BATCH requests and processed each response.
+The debit count is calculated from the approved responses to SALE 1–3. SALE 4
+is excluded because it is reversed. When all three responses are approved, the
+request contains:
 
-## Observed behavior
+```text
+distTrmBatchDrTxnCount : 0003
+distTrmBatchDrTxnAmt   : +000000000000000003
+distTrmBatchCrTxnCount : 0000
+distTrmBatchCrTxnAmt   : +000000000000000000
+distTrmBatchAdTxnCount : 0000
+distTrmBatchAdTxnAmt   : +000000000000000000
+```
 
-All CLOSE BATCH requests completed successfully. The previous behavior, where
-batch closing stopped after approximately the first 100 transactions, was not
-observed in the latest test.
-
-No response timeouts, socket errors, or incomplete batch-closing operations
-were observed. All pending batches were closed without a problem.
-
-## Pending transaction handling
-
-Each pending SALE in `sales_transmitted.json` is identified by the combination
-of its `tid` and `sequence_number`. The application removes exactly one
-matching entry only after its CLOSE BATCH receives a successful response code
-(`000`).
-
-If the CLOSE BATCH response code is any value other than `000` , the SALE is not removed. The same applies when the request times out or
-encounters a socket error. In all these cases, the SALE remains pending in
-`sales_transmitted.json` so it can be retried. Matching on both fields prevents
-a successful CLOSE for one TID from deleting a failed pending SALE belonging
-to another TID with the same sequence number.
+Credit and adjustment count/amount fields are always set to zero.
 
 ## Conclusion
 
-The latest test completed successfully for all 30 TIDs. All 900 SALE batches
-were closed, and the earlier limitation observed after approximately 100
-transactions could not be reproduced. The current CLOSE BATCH flow completed
-the full workload without errors.
+The solution resolves the unbalanced-batch problem by reversing SALE 4 with
+the same sequence number before sending CLOSE BATCH. The final batch includes
+only the approved, non-reversed SALE transactions, while its credit and
+adjustment totals remain zero. Therefore, the batch totals remain balanced.

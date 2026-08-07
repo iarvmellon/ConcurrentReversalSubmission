@@ -50,6 +50,15 @@ CAPTURED_PAYLOAD_REVERSAL = bytes.fromhex("""
 302020202032302020201c391e423036331c47393146413443344203
 """)
 
+# Exact CLOSE BATCH request captured on the wire. Dynamic header, totals, and
+# sequence fields are replaced before transmission.
+CLOSE_BATCH_PAYLOAD = bytes.fromhex("""
+009b392e333930303030343232322020202020202020202020202020323630373135313133343531
+414f36303035303030301c6c303031303030303030322b3030303030303030303030303030303035
+39303030302b303030303030303030303030303030303030303030312b3030303030303030303030
+303030303030311c68303031303230303133311c391e423036331c47344138394637434403
+""")
+
 
 def parse_spdh(payload: bytes) -> dict[str, str]:
     if len(payload) >= 2 and int.from_bytes(payload[:2], "big") == len(payload) - 2:
@@ -510,6 +519,49 @@ def build_reversal_payload(
     return bytes(payload)
 
 
+def build_close_batch_payload(
+    transmission_number: str,
+    sequence_number: str,
+    sale_count: int,
+    tid: str,
+    amount: str,
+) -> bytes:
+    """Fill the captured CLOSE BATCH request with current batch values."""
+    if len(transmission_number) != 2 or not transmission_number.isdigit():
+        raise ValueError("transmission_number must contain exactly 2 digits")
+    if len(sequence_number) != 10 or not sequence_number.isdigit():
+        raise ValueError("sequence_number must contain exactly 10 digits")
+    if len(tid) != 8 or not tid.isdigit():
+        raise ValueError("TID must contain exactly 8 digits")
+    if sale_count < 0 or sale_count > 9999:
+        raise ValueError("sale_count must be between 0 and 9999")
+    if not amount or not amount.isdigit():
+        raise ValueError("amount must contain only digits")
+
+    payload = bytearray(CLOSE_BATCH_PAYLOAD)
+    payload[4:6] = transmission_number.encode("ascii")
+    payload[6:14] = tid.encode("ascii")
+    now = datetime.now()
+    payload[28:34] = now.strftime("%y%m%d").encode("ascii")
+    payload[34:40] = now.strftime("%H%M%S").encode("ascii")
+
+    sequence_start = payload.index(b"\x1ch") + 2
+    payload[sequence_start:sequence_start + 10] = sequence_number.encode("ascii")
+
+    totals_start = payload.index(b"\x1cl") + 2
+    totals_end = payload.index(b"\x1c", totals_start)
+    totals = bytearray(payload[totals_start:totals_end])
+    totals[6:10] = f"{sale_count:04d}".encode("ascii")
+    totals[10:29] = f"+{sale_count * int(amount):018d}".encode("ascii")
+    totals[52:56] = b"0000"
+    totals[56:75] = b"+000000000000000000"
+    payload[totals_start:totals_end] = totals
+
+    remove_captured_mac(payload)
+    payload[:2] = (len(payload) - 2).to_bytes(2, "big")
+    return bytes(payload)
+
+
 def increment_sequence_third_component(sequence_number: str) -> str:
     """Increment the third 3-digit component while preserving the final flag."""
     if len(sequence_number) != 10 or not sequence_number.isdigit():
@@ -640,8 +692,9 @@ def send_sales_in_order(
     sales: list[tuple[str, str]],
     tid: str,
     amount: str,
+    experiment_delay: float = 0.1,
 ) -> list[dict[str, str]]:
-    """Send SALE messages sequentially through one TCP connection."""
+    """Send SALEs in order and close shortly after transmitting the last one."""
     if tid != ALLOWED_SALE_TID:
         raise ValueError(
             f"SALE blocked for TID={tid}; only TID={ALLOWED_SALE_TID} is allowed"
@@ -659,7 +712,8 @@ def send_sales_in_order(
         )
 
     responses = []
-    with socket.create_connection((host, port), timeout=timeout) as sock:
+    sock = socket.create_connection((host, port), timeout=timeout)
+    try:
         source_ip, source_port = sock.getsockname()[:2]
         for sale_number, (sequence_number, transmission_number) in enumerate(
             ordered_sales, 1
@@ -679,12 +733,62 @@ def send_sales_in_order(
                 flush=True,
             )
             sock.sendall(payload)
+            if sale_number == len(ordered_sales):
+                print(
+                    "Last SALE transmitted; closing its connection after "
+                    f"experiment_delay={experiment_delay}s",
+                    flush=True,
+                )
+                time.sleep(experiment_delay)
+                break
             sock.settimeout(timeout)
             response = sock.recv(4096)
             print(f"Response: {response_summary(response)}", flush=True)
             responses.append(parse_spdh(response))
+    finally:
+        if sock is not None:
+            sock.close()
 
     return responses
+
+
+def send_timeout_reversal(
+    host: str,
+    port: int,
+    timeout: float,
+    sale_sequence_number: str,
+    reversal_sequence_number: str,
+    transmission_number: str,
+    tid: str,
+    amount: str,
+) -> dict[str, str]:
+    """Send a timeout REVERSAL for the fourth SALE on a new connection."""
+    if reversal_sequence_number != sale_sequence_number:
+        raise ValueError(
+            f"REVERSAL sequence must match SALE sequence {sale_sequence_number}, "
+            f"got {reversal_sequence_number}"
+        )
+
+    sale_payload = build_payload(
+        sale_sequence_number,
+        transmission_number,
+        tid,
+        amount,
+    )
+    reversal_payload = build_reversal_payload(
+        sale_payload,
+        reversal_sequence_number,
+        amount,
+        approval_code="",
+    )
+    print_spdh_summary("REVERSAL request", reversal_payload)
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.sendall(reversal_payload)
+        sock.settimeout(timeout)
+        response = sock.recv(4096)
+
+    print(f"REVERSAL response: {response_summary(response)}", flush=True)
+    return parse_spdh(response)
 
 
 def send_reversal(
@@ -855,11 +959,21 @@ def send_close_batch(
     tid: str,
     amount: str,
 ) -> bool:
-    print(
-        f"CLOSE BATCH disabled: skipping request for TID={tid}",
-        flush=True,
+    payload = build_close_batch_payload(
+        transmission_number,
+        sequence_number,
+        sale_count,
+        tid,
+        amount,
     )
-    return False
+    print_spdh_summary("CLOSE BATCH request", payload)
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.sendall(payload)
+        sock.settimeout(timeout)
+        response = sock.recv(4096)
+
+    print(f"CLOSE BATCH response: {response_summary(response)}", flush=True)
+    return parse_spdh(response).get("response_code") in {"000", "001"}
 
 
 def send_packets(host: str, port: int, timeout: float, *, state_file=STATE_FILE,

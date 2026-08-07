@@ -19,6 +19,14 @@ before the response to the final SALE is received.
 - After receiving the REVERSAL response, it waits one second and sends one
   CLOSE BATCH over a third connection.
 
+The host-side Transactions Log used to verify this sequence is shown in
+Figure 1.
+
+![Figure 1 — Host Transactions Log for the SALE, REVERSAL, and CLOSE BATCH flow](images/Picture1.png)
+
+*Figure 1. Host Transactions Log captured during verification of the
+transaction flow.*
+
 ## CLOSE BATCH totals
 
 The debit count is calculated from the approved responses to SALE 1–3. SALE 4
@@ -41,4 +49,6 @@ Credit and adjustment count/amount fields are always set to zero.
 The solution resolves the unbalanced-batch problem by reversing SALE 4 with
 the same sequence number before sending CLOSE BATCH. The final batch includes
 only the approved, non-reversed SALE transactions, while its credit and
-adjustment totals remain zero. Therefore, the batch totals remain balanced.
+adjustment totals remain zero. The host log in Figure 1 provides the
+transaction-level record of the tested flow. Therefore, the batch totals
+remain balanced.
